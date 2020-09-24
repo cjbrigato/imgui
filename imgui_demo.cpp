@@ -77,6 +77,23 @@ Index of this file:
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 
+#include "imgui_internal.h"
+#include <chrono>
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
+static uint64_t ImTimeGetInMicroseconds()
+{
+# if !defined(__APPLE__)
+    // Trying std::chrono out of unfettered optimism that it may actually work..
+    using namespace std;
+    chrono::microseconds ms = chrono::duration_cast<chrono::microseconds>(chrono::high_resolution_clock::now().time_since_epoch());
+    return (uint64_t)ms.count();
+# else
+    return 0;
+# endif
+}
+
 // System includes
 #include <ctype.h>          // toupper
 #include <limits.h>         // INT_MIN, INT_MAX
@@ -260,7 +277,7 @@ void ImGui::ShowDemoWindow(bool* p_open)
     static bool show_app_constrained_resize = false;
     static bool show_app_simple_overlay = false;
     static bool show_app_window_titles = false;
-    static bool show_app_custom_rendering = false;
+    static bool show_app_custom_rendering = true;
 
     if (show_app_main_menu_bar)       ShowExampleAppMainMenuBar();
     if (show_app_documents)           ShowExampleAppDocuments(&show_app_documents);
@@ -7093,6 +7110,348 @@ static void ShowExampleAppCustomRendering(bool* p_open)
                 draw_list->AddLine(ImVec2(origin.x + points[n].x, origin.y + points[n].y), ImVec2(origin.x + points[n + 1].x, origin.y + points[n + 1].y), IM_COL32(255, 255, 0, 255), 2.0f);
             draw_list->PopClipRect();
 
+            ImGui::EndTabItem();
+        }
+
+        static int flags = ImGuiTabItemFlags_SetSelected;
+
+        if (ImGui::BeginTabItem("Adaptive Arc", NULL, flags))
+        {
+            flags = 0;
+
+            ImGui::PushItemWidth(-ImGui::GetFontSize() * 10);
+
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+            const int ROWS = 2;
+
+            const float PI = 3.14159265358979323846f;
+            static int N = 1;//100;
+            static int M = 1;
+            static float sz = 72.0f * 1.5f;
+            static float thickness = 3.0f;
+            static float margin = 4.0f;
+            static float start_angle_offset = 0.0f;
+            static float arc_step = PI * 0.5f;
+            static bool show_stats = true;
+            static bool arc_segments_override = false;
+            static int arc_segments_override_v = 10;
+            static ImVec4 col_fg = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
+            static ImVec4 col_bg = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+            ImGui::DragFloat("Size", &sz, 0.2f, 2.0f, 144.0f * 4.0f, "%.0f");
+            ImGui::DragFloat("Thickness", &thickness, 0.05f, 1.0f, 8.0f, "%.02f");
+            ImGui::DragFloat("Start Angle Offset", &start_angle_offset, PI / 180.0f, 0.0f, PI * 2.0f, "%.02f");
+            ImGui::DragFloat("Arc Step", &arc_step, PI / 720.0f, 0.0f, PI * 0.5f, "%.02f");
+            ImGui::Checkbox("##arcsegmentoverride", &arc_segments_override);
+            ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+            if (ImGui::SliderInt("Arc Segments", &arc_segments_override_v, 3, 40))
+                arc_segments_override = true;
+            if (ImGui::DragInt("Repeats", &N, 1.0f, 1, 5000) && N < 1)
+                N = 1;
+            ImGui::Checkbox("Show Stats", &show_stats);
+
+            ImGui::Columns(2);
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+            ImGui::Text("ArcFast Lookup Table Size: %d", IM_ARRAYSIZE(draw_list->_Data->ArcFastVtx));
+            ImGui::Text("ArcFast Radius Threshold: %.2f", draw_list->_Data->ArcFastRadiusThreshold);
+# endif
+            ImGui::Text("Radius: %.2f", sz * 0.5f);
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+            ImGui::SameLine();
+            if (sz * 0.5f < draw_list->_Data->ArcFastRadiusThreshold)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 1.0f, 0.5f, 1.0f));
+                ImGui::TextUnformatted("(adaptive)");
+                ImGui::PopStyleColor();
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.5f, 0.5f, 1.0f));
+                ImGui::TextUnformatted("(fallback to PathArcTo)");
+                ImGui::PopStyleColor();
+            }
+# endif
+            ImGui::NextColumn();
+
+            static ImGuiTextBuffer stats;
+            static bool  bench_enabled = false;
+            static float bench_radius = 0.0f;
+            static float bench_min_radius = 0.0f;
+            static float bench_max_radius = 50.0f;
+            static float bench_radius_step = 1.0f;
+            static int   bench_N = 1000;
+            static int   bench_M = 50;
+
+            static float bench_last_radius = 0.0f;
+            static int   bench_last_N      = 0;
+
+            if (bench_enabled)
+            {
+                bench_radius += bench_radius_step;
+                if (bench_radius > bench_max_radius)
+                {
+                    bench_enabled = false;
+                    bench_radius  = bench_last_radius;
+                    N             = bench_last_N;
+                    M             = 1;
+
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+                    FILE* file = fopen("bench_stats_new.csv", "wb");
+# else
+                    FILE* file = fopen("bench_stats.csv", "wb");
+# endif
+                    fputs(stats.c_str(), file);
+                    fclose(file);
+                }
+            }
+
+            const char* type_names[3] =
+            {
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+                "PathArcToFast2",
+# else
+                "PathArcToFast",
+# endif
+                "PathArcTo(N = 0)",
+                "PathArcToFast2",
+            };
+
+            if (arc_segments_override)
+            {
+                static ImGuiTextBuffer buffer;
+                buffer.clear();
+                buffer.appendf("PathArcTo(N = %d)", arc_segments_override_v);
+                type_names[1] = buffer.c_str();
+            }
+            else
+            {
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+                type_names[1] = "PathArcTo(N = 0)";
+# else
+                type_names[1] = "PathArcTo(N = 10)";
+# endif
+            }
+
+            if (!bench_enabled)
+            {
+                if (ImGui::Button("Benchmark & Save CSV"))
+                {
+                    bench_enabled       = true;
+                    bench_last_radius   = sz * 0.5f;
+                    bench_last_N        = N;
+
+                    bench_radius        = bench_min_radius;
+                    N                   = bench_N;
+                    M                   = bench_M;
+
+                    //int seg = arc_segments_override ? arc_segments_override_v : 10;
+                    stats.clear();
+                    stats.appendf(
+                        "Thickness;Start Angle;Arc Step;Repeats;\n"
+                        "%f;%f;%f;%d\n\n",
+                        thickness, start_angle_offset, arc_step, N);
+
+                    stats.append("Radius;");
+                    for (int j = 0; j < ROWS; ++j)
+                        stats.appendf("%s;%s;%s;%s;", type_names[j], type_names[j], type_names[j], type_names[j]);
+                    stats.append("\n");
+                }
+                if (ImGui::DragInt("Bench Samples", &bench_N, 1.0f, 1, 5000) && bench_N < 1)
+                    bench_N = 1;
+                if (ImGui::DragInt("Bench Repeats", &bench_M, 1.0f, 1, 5000) && bench_M < 1)
+                    bench_M = 1;
+            }
+            else
+            {
+                ImGui::TextUnformatted("Collecting data...");
+            }
+
+            if (bench_enabled)
+                sz = bench_radius * 2.0f;
+
+            ImGui::EndColumns();
+
+            ImGui::Spacing();
+
+            margin = 4.0f + thickness;
+
+            //uint64_t path_duration_stats[12] = {};
+            //uint64_t stroke_duration_stats[12] = {};
+            uint64_t total_duration_stats[12] = {};
+
+            ImVec2 startCursor = ImGui::GetCursorScreenPos();
+
+            for (int z = 0; z < M; ++z)
+            {
+                ImGui::SetCursorScreenPos(startCursor);
+
+                for (int i = 0; i < (ROWS * 4); ++i)
+                {
+                    const int   type = i / 4;
+                    const float radius = sz * 0.5f;
+                    const float angle_start = start_angle_offset;
+                    const float angle_end = start_angle_offset + ((i % 4) + 1) * arc_step;
+
+                    if ((i % 4) == 0)
+                    {
+                        ImGui::Spacing();
+                        ImGui::TextUnformatted(type_names[type]);
+                    }
+                    else
+                        ImGui::SameLine();
+
+                    ImVec2 cursor = ImGui::GetCursorScreenPos();
+
+                    ImVec2 widget_position = cursor;
+                    ImVec2 widget_size = ImVec2(sz + margin * 2.0f, sz + margin * 2.0f);
+
+                    ImVec2 canvas_position = ImVec2(cursor.x + margin, cursor.y + margin);
+                    ImVec2 canvas_size = ImVec2(sz, sz);
+                    ImVec2 canvas_center = ImVec2(canvas_position.x + canvas_size.x * 0.5f, canvas_position.y + canvas_size.y * 0.5f);
+
+                    //draw_list->Flags &= ~ImDrawListFlags_AntiAliasedLines;
+
+                    draw_list->AddRectFilled(widget_position, ImVec2(widget_position.x + widget_size.x, widget_position.y + widget_size.y), ImColor(col_bg));
+
+                    draw_list->AddCircle(canvas_center, radius + 0.5f, IM_COL32(255, 192, 192, 255),
+                        IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC(radius, draw_list->_Data->CircleSegmentMaxError),
+                        thickness);
+
+                    uint64_t path_start = 0;
+                    uint64_t path_end = 0;
+                    switch (type)
+                    {
+                        case 0:
+                            path_start = ImTimeGetInMicroseconds();
+                            for (int n = 0; n < N; ++n)
+                            {
+                                draw_list->_Path.resize(0);
+                                //const int segment_count = ImMax((int)(IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC(radius, draw_list->_Data->CircleSegmentMaxError) * (angle_end - angle_start) / (2.0f * PI)), IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_MIN);
+                                //draw_list->PathArcTo(canvas_center, radius, angle_start, angle_end, segment_count);
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+                                draw_list->PathArcToFast2(canvas_center, radius,
+                                    (int)(angle_start * IM_DRAWLIST_ARCFAST_SAMPLES / (PI * 2.0f)),
+                                    (int)(angle_end   * IM_DRAWLIST_ARCFAST_SAMPLES / (PI * 2.0f))
+                                );
+# else
+                                draw_list->PathArcToFast(canvas_center, radius,
+                                    (int)(angle_start * 12 / (PI * 2.0f)),
+                                    (int)(angle_end   * 12 / (PI * 2.0f))
+                                );
+# endif
+                            }
+                            path_end = ImTimeGetInMicroseconds();
+                            break;
+
+                        case 1:
+                            if (arc_segments_override)
+                            {
+                                path_start = ImTimeGetInMicroseconds();
+                                for (int n = 0; n < N; ++n)
+                                {
+                                    draw_list->_Path.resize(0);
+                                    draw_list->PathArcTo(canvas_center, radius, angle_start, angle_end, arc_segments_override_v);
+                                }
+                                path_end = ImTimeGetInMicroseconds();
+                            }
+                            else
+                            {
+                                path_start = ImTimeGetInMicroseconds();
+                                for (int n = 0; n < N; ++n)
+                                {
+                                    draw_list->_Path.resize(0);
+                                    draw_list->PathArcTo(canvas_center, radius, angle_start, angle_end);
+                                }
+                                path_end = ImTimeGetInMicroseconds();
+                            }
+                            break;
+
+                        case 2:
+# if defined(IM_DRAWLIST_ARCFAST_SAMPLES)
+                            path_start = ImTimeGetInMicroseconds();
+                            for (int n = 0; n < N; ++n)
+                            {
+                                draw_list->_Path.resize(0);
+                                draw_list->PathArcToFast2(canvas_center, radius,
+                                    (int)(angle_start * 48 / (PI * 2.0f)),
+                                    (int)(angle_end * 48 / (PI * 2.0f))
+                                );
+                            }
+                            path_end = ImTimeGetInMicroseconds();
+# endif
+                            //path_start = ImTimeGetInMicroseconds();
+                            //for (int n = 0; n < N; ++n)
+                            //{
+                            //    draw_list->_Path.resize(0);
+                            //    draw_list->PathArcTo(canvas_center, radius, angle_start, angle_end, 0);
+                            //}
+                            //path_end = ImTimeGetInMicroseconds();
+                            break;
+                    }
+                    uint64_t path_duration = path_end - path_start;
+
+                    int path_vertices = draw_list->_Path.Size;
+
+                    draw_list->AddDrawCmd();
+
+                    int             path_size = draw_list->_Path.Size;
+                    unsigned int    element_count = draw_list->CmdBuffer.Data[draw_list->CmdBuffer.Size - 1].ElemCount;
+                    int             vertex_buffer_size = draw_list->VtxBuffer.Size;
+                    int             index_buffer_size = draw_list->IdxBuffer.Size;
+                    unsigned int    current_index = draw_list->_VtxCurrentIdx;
+
+                    uint64_t stroke_start = ImTimeGetInMicroseconds();
+                    for (int n = 0; n < N; ++n)
+                    {
+                        draw_list->_Path.Size = path_size;
+                        draw_list->CmdBuffer.Data[draw_list->CmdBuffer.Size - 1].ElemCount = element_count;
+                        draw_list->VtxBuffer.Size = vertex_buffer_size;
+                        draw_list->_VtxWritePtr = draw_list->VtxBuffer.Data + vertex_buffer_size;
+                        draw_list->IdxBuffer.Size = index_buffer_size;
+                        draw_list->_IdxWritePtr = draw_list->IdxBuffer.Data + index_buffer_size;
+                        draw_list->_VtxCurrentIdx = current_index;
+
+                        draw_list->PathStroke(ImColor(col_fg), false, thickness);
+                    }
+                    uint64_t stroke_end = ImTimeGetInMicroseconds();
+                    uint64_t stroke_duration = stroke_end - stroke_start;
+
+                    //draw_list->Flags |= ImDrawListFlags_AntiAliasedLines;
+
+                    //path_duration_stats[i]   = path_duration;
+                    //stroke_duration_stats[i] = stroke_duration;
+                    total_duration_stats[i] += path_duration + stroke_duration;
+
+                    ImGui::BeginGroup();
+                    ImGui::Dummy(widget_size);
+                    if (show_stats)
+                    {
+                        ImGui::Text("Vertices: %d", path_vertices);
+                        ImGui::Text("Path:   %8.3f us", (float)path_duration / N);
+                        ImGui::Text("Stroke: %8.3f us", (float)stroke_duration / N);
+                        ImGui::Text("Total:  %8.3f us", (float)(path_duration + stroke_duration) / N);
+                    }
+                    ImGui::EndGroup();
+                }
+            }
+
+            if (bench_enabled)
+            {
+                stats.appendf("%f;", bench_radius);
+
+                for (int j = 0; j < ROWS; ++j)
+                    stats.appendf(
+                        "%" PRIu64 ";%" PRIu64 ";%" PRIu64 ";%" PRIu64 ";",
+                        total_duration_stats[j * 4 + 0] / (uint64_t)M,
+                        total_duration_stats[j * 4 + 1] / (uint64_t)M,
+                        total_duration_stats[j * 4 + 2] / (uint64_t)M,
+                        total_duration_stats[j * 4 + 3] / (uint64_t)M);
+
+                stats.append("\n");
+            }
+
+
+            ImGui::PopItemWidth();
             ImGui::EndTabItem();
         }
 
