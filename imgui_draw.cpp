@@ -368,6 +368,8 @@ ImDrawListSharedData::ImDrawListSharedData()
         const float a = ((float)i * 2 * IM_PI) / (float)IM_ARRAYSIZE(ArcFastVtx);
         ArcFastVtx[i] = ImVec2(ImCos(a), ImSin(a));
     }
+
+    ArcFastRadiusThreshold = IM_DRAWLIST_ARCFAST_RADIUS_THRESHOLD_CALC(IM_DRAWLIST_ARCFAST_SAMPLES, 1.6f);
 }
 
 void ImDrawListSharedData::SetCircleSegmentMaxError(float max_error)
@@ -381,6 +383,11 @@ void ImDrawListSharedData::SetCircleSegmentMaxError(float max_error)
         const int segment_count = IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC(radius, CircleSegmentMaxError);
         CircleSegmentCounts[i] = (ImU8)ImMin(segment_count, 255);
     }
+
+    if (IM_DRAWLIST_ARCFAST_SAMPLES >= 2 && max_error != 0.0f) // These are constrains of IM_DRAWLIST_ARCFAST_RADIUS_THRESHOLD_CALC
+        ArcFastRadiusThreshold = IM_DRAWLIST_ARCFAST_RADIUS_THRESHOLD_CALC(IM_DRAWLIST_ARCFAST_SAMPLES, max_error);
+    else
+        ArcFastRadiusThreshold = IM_DRAWLIST_ARCFAST_RADIUS_THRESHOLD_CALC(IM_DRAWLIST_ARCFAST_SAMPLES, 1.6f);
 }
 
 // Initialize before use in a new frame. We always have a command ready in the buffer.
@@ -1017,16 +1024,65 @@ void ImDrawList::PathArcToFast(const ImVec2& center, float radius, int a_min_of_
         return;
     }
 
-    // For legacy reason the PathArcToFast() always takes angles where 2*PI is represented by 12,
-    // but it is possible to set IM_DRAWLIST_ARCFAST_TESSELATION_MULTIPLIER to a higher value. This should compile to a no-op otherwise.
-#if IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER != 1
-    a_min_of_12 *= IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER;
-    a_max_of_12 *= IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER;
-#endif
-
-    _Path.reserve(_Path.Size + (a_max_of_12 - a_min_of_12 + 1));
-    for (int a = a_min_of_12; a <= a_max_of_12; a++)
+    if (a_min_of_12 == 0 && a_max_of_12 == 11)
     {
+        a_max_of_12 = IM_DRAWLIST_ARCFAST_SAMPLES - 1;
+    }
+    else
+    {
+        a_min_of_12 = a_min_of_12 * IM_DRAWLIST_ARCFAST_SAMPLES / 12;
+        a_max_of_12 = a_max_of_12 * IM_DRAWLIST_ARCFAST_SAMPLES / 12;
+    }
+
+    PathArcToFast2(center, radius, a_min_of_12, a_max_of_12);
+}
+
+void ImDrawList::PathArcToFast2(const ImVec2& center, float radius, int a_min_sample, int a_max_sample, int a_step)
+{
+    if ((a_min_sample > a_max_sample) || (a_step < 0))
+        return;
+
+    if (radius == 0.0f)
+    {
+        _Path.push_back(center);
+        return;
+    }
+
+    if (a_step == 0)
+    {
+        // Determine step size between samples. Small radii usually allow to skip more than
+        // one sample, reduce geometry complexity without harming visual output.
+        //
+        // For CircleSegmentMaxError = 1.6 number of of samples is 2.84,
+        // which is rounded down to 2 (Calculated from unclamped IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC).
+        // Error calculation is based on number of samples. If we use rounded down value, we
+        // will always get values greater than CircleSegmentMaxError. This is bad, because
+        // it will lead to higher step count and to visual artifacts. To keep error values
+        // under CircleSegmentMaxError we can simply add one to number of samples.
+        // This will lead to slightly higher than necessary precision for some radii,
+        // but will never introduce visible artifacts.
+        const float error_for_radius = IM_DRAWLIST_ARCFAST_RADIUS_ERROR_CALC(IM_DRAWLIST_ARCFAST_SAMPLES + 1, radius);
+        if (_Data->CircleSegmentMaxError > error_for_radius)
+            // Reduce step, but never go lower than 2 samples per quarter of the circle.
+            a_step = ImMin((int)ImSqrt(_Data->CircleSegmentMaxError / error_for_radius), IM_DRAWLIST_ARCFAST_SAMPLES / (4 * 2));
+    }
+
+    const int  distance = a_max_sample - a_min_sample;
+    const bool extra_max_sample = ((a_max_sample - a_min_sample) % a_step) != 0;
+
+    const int samples = (distance) / a_step + (extra_max_sample ? 1 : 0);
+
+    _Path.reserve(_Path.Size + samples);
+
+    for (int a = a_min_sample; a <= a_max_sample; a += a_step)
+    {
+        const ImVec2& c = _Data->ArcFastVtx[a % IM_ARRAYSIZE(_Data->ArcFastVtx)];
+        _Path.push_back(ImVec2(center.x + c.x * radius, center.y + c.y * radius));
+    }
+
+    if (extra_max_sample)
+    {
+        const int a = a_max_sample;
         const ImVec2& c = _Data->ArcFastVtx[a % IM_ARRAYSIZE(_Data->ArcFastVtx)];
         _Path.push_back(ImVec2(center.x + c.x * radius, center.y + c.y * radius));
     }
@@ -1034,19 +1090,58 @@ void ImDrawList::PathArcToFast(const ImVec2& center, float radius, int a_min_of_
 
 void ImDrawList::PathArcTo(const ImVec2& center, float radius, float a_min, float a_max, int num_segments)
 {
+    if (a_min >= a_max)
+        return;
+
     if (radius == 0.0f)
     {
         _Path.push_back(center);
         return;
     }
 
-    // Note that we are adding a point at both a_min and a_max.
-    // If you are trying to draw a full closed circle you don't want the overlapping points!
-    _Path.reserve(_Path.Size + (num_segments + 1));
-    for (int i = 0; i <= num_segments; i++)
+    if (num_segments <= 0 && radius <= _Data->ArcFastRadiusThreshold)
     {
-        const float a = a_min + ((float)i / (float)num_segments) * (a_max - a_min);
-        _Path.push_back(ImVec2(center.x + ImCos(a) * radius, center.y + ImSin(a) * radius));
+        // Determine first and last sample in lookup table that belong to the arc.
+        const int a_min_sample = (int)ImCeil(IM_DRAWLIST_ARCFAST_SAMPLES * a_min / (IM_PI * 2.0f));
+        const int a_max_sample = (int)(IM_DRAWLIST_ARCFAST_SAMPLES       * a_max / (IM_PI * 2.0f));
+        const int a_mid_samples = ImMax(a_max_sample - a_min_sample, 0);
+
+        const float a_min_segment_angle = a_min_sample * IM_PI * 2.0f / IM_DRAWLIST_ARCFAST_SAMPLES;
+        const float a_max_segment_angle = a_max_sample * IM_PI * 2.0f / IM_DRAWLIST_ARCFAST_SAMPLES;
+
+        const bool a_emit_start = (a_min_segment_angle - a_min) > 0.0f;
+        const bool a_emit_end   = (a_max - a_max_segment_angle) > 0.0f;
+
+        _Path.reserve(_Path.Size + (a_mid_samples + 1 + (a_emit_start ? 1 : 0) + (a_emit_end ? 1 : 0)));
+
+        if (a_emit_start)
+            _Path.push_back(ImVec2(center.x + ImCos(a_min) * radius, center.y + ImSin(a_min) * radius));
+
+        if (a_max_sample >= a_min_sample)
+            PathArcToFast2(center, radius, a_min_sample, a_max_sample);
+
+        if (a_emit_end)
+            _Path.push_back(ImVec2(center.x + ImCos(a_max) * radius, center.y + ImSin(a_max) * radius));
+    }
+    else
+    {
+        if (num_segments <= 0)
+        {
+            const float arc_length = a_max - a_min;
+            const int circle_segment_count = IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC(radius, _Data->CircleSegmentMaxError);
+            const int arc_segment_count = ImMax((int)(circle_segment_count * arc_length / (IM_PI * 2.0f)), 2);
+
+            num_segments = arc_segment_count;
+        }
+
+        // Note that we are adding a point at both a_min and a_max.
+        // If you are trying to draw a full closed circle you don't want the overlapping points!
+        _Path.reserve(_Path.Size + (num_segments + 1));
+        for (int i = 0; i <= num_segments; i++)
+        {
+            const float a = a_min + ((float)i / (float)num_segments) * (a_max - a_min);
+            _Path.push_back(ImVec2(center.x + ImCos(a) * radius, center.y + ImSin(a) * radius));
+        }
     }
 }
 

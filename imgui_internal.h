@@ -366,6 +366,8 @@ static inline float  ImAbs(float x)             { return fabsf(x); }
 static inline double ImAbs(double x)            { return fabs(x); }
 static inline float  ImSign(float x)            { return (x < 0.0f) ? -1.0f : ((x > 0.0f) ? 1.0f : 0.0f); } // Sign operator - returns -1, 0 or 1 based on sign of argument
 static inline double ImSign(double x)           { return (x < 0.0) ? -1.0 : ((x > 0.0) ? 1.0 : 0.0); }
+static inline float  ImSqr(float x)             { return x * x; }
+static inline double ImSqr(double x)            { return x * x; }
 #endif
 // - ImMin/ImMax/ImClamp/ImLerp/ImSwap are used by widgets which support variety of types: signed/unsigned int/long long float/double
 // (Exceptionally using templates here but we could also redefine them for those types)
@@ -612,10 +614,16 @@ struct IMGUI_API ImChunkStream
 #define IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_MAX                     512
 #define IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC(_RAD,_MAXERROR)    ImClamp((int)((IM_PI * 2.0f) / ImAcos(((_RAD) - (_MAXERROR)) / (_RAD))), IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_MIN, IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_MAX)
 
-// ImDrawList: You may set this to higher values (e.g. 2 or 3) to increase tessellation of fast rounded corners path.
-#ifndef IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER
-#define IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER             1
+// ImDrawList: Lookup table size for adaptive arc drawing.
+#ifndef IM_DRAWLIST_ARCFAST_SAMPLES
+#define IM_DRAWLIST_ARCFAST_SAMPLES                             (48 * 6)              // Number of samples in lookup table.
 #endif
+// Cutoff radius is calculated by formula (derived from IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC):
+//      threshold = -(err/(-1 + cos((2 pi)/N))) && err != 0 && N >= 2
+#define IM_DRAWLIST_ARCFAST_RADIUS_THRESHOLD_CALC(_N,_MAXERROR)  (-((_MAXERROR)/(-1.0f + ImCos((IM_PI * 2.0f) / (_N)))))
+// Error calculation for given radius and segment count (derived from IM_DRAWLIST_CIRCLE_AUTO_SEGMENT_CALC):
+//      error = (2 rad (sin(pi / N)^2)) && rad != 0 && N >= 2
+#define IM_DRAWLIST_ARCFAST_RADIUS_ERROR_CALC(_N,_RAD)  (2.0f * (_RAD) * ImSqr(ImSin(IM_PI / (_N))))
 
 // Data shared between all ImDrawList instances
 // You may want to create your own instance of this if you want to use ImDrawList completely without ImGui. In that case, watch out for future changes to this structure.
@@ -630,9 +638,10 @@ struct IMGUI_API ImDrawListSharedData
     ImDrawListFlags InitialFlags;               // Initial flags at the beginning of the frame (it is possible to alter flags on a per-drawlist basis afterwards)
 
     // [Internal] Lookup tables
-    ImVec2          ArcFastVtx[12 * IM_DRAWLIST_ARCFAST_TESSELLATION_MULTIPLIER];  // FIXME: Bake rounded corners fill/borders in atlas
+    ImVec2          ArcFastVtx[IM_DRAWLIST_ARCFAST_SAMPLES]; // Sample points on the circle.
     ImU8            CircleSegmentCounts[64];    // Precomputed segment count for given radius (array index + 1) before we calculate it dynamically (to avoid calculation overhead)
     const ImVec4*   TexUvLines;                 // UV of anti-aliased lines in the atlas
+    float           ArcFastRadiusThreshold;     // Cutoff radius after which arc drawing will fallback to slower PathArcTo()
 
     ImDrawListSharedData();
     void SetCircleSegmentMaxError(float max_error);
