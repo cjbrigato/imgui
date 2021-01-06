@@ -4500,10 +4500,10 @@ const char* ImGui::GetKeyName(ImGuiKey imgui_key)
 
 int ImGui::FindImGuiKey(int user_key_index)
 {
-    if (user_key_index < 0 || user_key_index >= IM_ARRAYSIZE(ImGuiIO::KeysDown))
-        return -1;
-
     ImGuiContext& g = *GImGui;
+
+    if (user_key_index < 0 || user_key_index >= IM_ARRAYSIZE(g.IO.KeysDown))
+        return -1;
 
     for (int n = 0; n < ImGuiKey_COUNT; ++n)
         if (g.IO.KeyMap[n] == user_key_index)
